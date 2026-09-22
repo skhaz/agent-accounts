@@ -123,6 +123,14 @@ def limit_text(name, limit):
     return text
 
 
+def resets_text(data):
+    credits = (data or {}).get("rate_limit_reset_credits") or {}
+    count = credits.get("available_count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None
+    return f"Resets: {count} available"
+
+
 def status(path):
     address = path.stem
     try:
@@ -138,6 +146,9 @@ def status(path):
         limits.extend((item["limit_name"], item.get("rate_limit")) for item in data.get("additional_rate_limits") or [])
         limits.append(("Review", data.get("code_review_rate_limit")))
         text = "\n    ".join(limit_text(name, limit) for name, limit in limits if limit)
+        resets = resets_text(data)
+        if resets:
+            text = f"{text}\n    {resets}" if text else resets
         return address, text or "Limits not available.", True
     except requests.HTTPError as exc:
         return address, f"HTTP {exc.response.status_code}. Run cx login if the session expired.", False
