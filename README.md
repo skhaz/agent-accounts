@@ -36,7 +36,7 @@ claude
 You can also run `uv run ax.py` with the same arguments.
 At zero percent, `ax` shows the reset date in the host time zone.
 
-Keep `config.toml` beside the script.
+Keep `config.toml` and `ax.j2` beside the script.
 Do not share credential files.
 
 ## Codex

@@ -1,12 +1,13 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["requests>=2.34.2"]
+# dependencies = ["httpx>=0.28.1", "jinja2>=3.1.6"]
 # ///
 
 import argparse
+import asyncio
 import base64
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from datetime import datetime, timezone
 import fcntl
 import getpass
@@ -20,11 +21,16 @@ import tempfile
 import time
 import tomllib
 
-import requests
+import httpx
+import jinja2
 
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = tomllib.loads((ROOT / "config.toml").read_text())
+TEMPLATES = jinja2.Environment(
+    loader=jinja2.FileSystemLoader(ROOT), undefined=jinja2.StrictUndefined,
+    trim_blocks=True, lstrip_blocks=True, keep_trailing_newline=True,
+)
 
 
 def home(value, variable):
@@ -48,14 +54,10 @@ def write(path, value):
         Path(name).unlink(missing_ok=True)
 
 
-def request(url, headers=None, data=None):
-    with requests.request(
-        "GET" if data is None else "POST", url,
-        headers=headers, json=data, timeout=CONFIG["timeout_seconds"],
-        allow_redirects=False,
-    ) as response:
-        response.raise_for_status()
-        return response.json()
+async def request(client, url, headers=None, data=None):
+    response = await client.request("GET" if data is None else "POST", url, headers=headers, json=data)
+    response.raise_for_status()
+    return response.json()
 
 
 def remaining_text(duration, used, reset):
@@ -82,24 +84,25 @@ class Provider:
             write(path, auth)
         return address
 
-    def status(self, path):
+    async def status(self, client, path, active):
         address = path.stem
         try:
             auth = read(path)
             address = self.email(auth)
             try:
-                data = self.usage(auth)
-            except requests.HTTPError as exc:
+                data = await self.usage(client, auth)
+            except httpx.HTTPStatusError as exc:
                 if exc.response.status_code != 401:
                     raise
-                data = self.usage(self.refresh(path, auth))
-            return address, self.limits_text(data) or "Limits not available.", True
-        except requests.HTTPError as exc:
-            return address, f"HTTP {exc.response.status_code}. Run ax {self.name} login if the session expired.", False
-        except requests.RequestException:
-            return address, "Request failed. Check the connection and try again.", False
+                data = await self.usage(client, await self.refresh(client, path, auth))
+            lines, ok = self.limits(data) or ["Limits not available."], True
+        except httpx.HTTPStatusError as exc:
+            lines, ok = [f"HTTP {exc.response.status_code}. Run ax {self.name} login if the session expired."], False
+        except httpx.HTTPError:
+            lines, ok = ["Request failed. Check the connection and try again."], False
         except (KeyError, ValueError, TypeError, OSError, subprocess.CalledProcessError) as exc:
-            return address, f"Cannot read account status: {type(exc).__name__}.", False
+            lines, ok = [f"Cannot read account status: {type(exc).__name__}."], False
+        return {"address": address, "active": address == active, "lines": lines, "ok": ok}
 
 
 class Codex(Provider):
@@ -121,19 +124,19 @@ class Codex(Provider):
         claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
         return (claims.get("email") or claims["https://api.openai.com/profile"]["email"]).casefold()
 
-    def usage(self, auth):
+    async def usage(self, client, auth):
         tokens = auth["tokens"]
-        return request(self.config["usage_url"], headers={
+        return await request(client, self.config["usage_url"], headers={
             "Authorization": "Bearer " + tokens["access_token"],
             "ChatGPT-Account-Id": tokens["account_id"],
         })
 
-    def refresh(self, path, auth):
+    async def refresh(self, client, path, auth):
         current = self.current()
         if current and self.email(current) == self.email(auth) and current != auth:
             self.save(current)
             return current
-        result = request(self.config["token_url"], data={
+        result = await request(client, self.config["token_url"], data={
             "client_id": self.config["client_id"],
             "grant_type": "refresh_token",
             "refresh_token": auth["tokens"]["refresh_token"],
@@ -162,7 +165,7 @@ class Codex(Provider):
             text += " · limit reached"
         return text
 
-    def limits_text(self, data):
+    def limits(self, data):
         limits = [("Codex", data.get("rate_limit"))]
         limits.extend((item["limit_name"], item.get("rate_limit")) for item in data.get("additional_rate_limits") or [])
         limits.append(("Review", data.get("code_review_rate_limit")))
@@ -170,7 +173,7 @@ class Codex(Provider):
         count = (data.get("rate_limit_reset_credits") or {}).get("available_count")
         if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
             lines.append(f"Resets: {count} available")
-        return "\n    ".join(lines)
+        return lines
 
     def login(self, device_auth):
         with tempfile.TemporaryDirectory(dir=self.accounts) as directory:
@@ -258,19 +261,19 @@ class Claude(Provider):
     def email(self, auth):
         return auth["oauthAccount"]["emailAddress"].casefold()
 
-    def usage(self, auth):
-        return request(self.config["usage_url"], headers={
+    async def usage(self, client, auth):
+        return await request(client, self.config["usage_url"], headers={
             "Authorization": "Bearer " + auth["claudeAiOauth"]["accessToken"],
             "anthropic-beta": self.config["beta"],
         })
 
-    def refresh(self, path, auth):
-        current = self.current()
+    async def refresh(self, client, path, auth):
+        current = await asyncio.to_thread(self.current)
         if current and self.email(current) == self.email(auth) and current != auth:
             self.save(current)
             return current
         original = auth["claudeAiOauth"].copy()
-        result = request(self.config["token_url"], data={
+        result = await request(client, self.config["token_url"], data={
             "client_id": self.config["client_id"],
             "grant_type": "refresh_token",
             "refresh_token": original["refreshToken"],
@@ -281,12 +284,12 @@ class Claude(Provider):
         if result.get("expires_in"):
             auth["claudeAiOauth"]["expiresAt"] = int((time.time() + result["expires_in"]) * 1000)
         write(path, auth)
-        current = self.current()
+        current = await asyncio.to_thread(self.current)
         if current and current["claudeAiOauth"] == original:
-            self.write_credentials(auth["claudeAiOauth"])
+            await asyncio.to_thread(self.write_credentials, auth["claudeAiOauth"])
         return auth
 
-    def limits_text(self, data):
+    def limits(self, data):
         groups = {}
         for limit in data.get("limits") or []:
             scope = ((limit.get("scope") or {}).get("model") or {}).get("display_name") or "Claude"
@@ -294,7 +297,7 @@ class Claude(Provider):
             reset = limit.get("resets_at")
             reset = datetime.fromisoformat(reset) if reset else None
             groups.setdefault(scope, []).append(remaining_text(duration, limit.get("percent") or 0, reset))
-        return "\n    ".join(f"{name}: " + " | ".join(windows) for name, windows in groups.items())
+        return [f"{name}: " + " | ".join(windows) for name, windows in groups.items()]
 
     def login(self, device_auth):
         with tempfile.TemporaryDirectory(dir=self.accounts) as directory:
@@ -318,7 +321,7 @@ class Claude(Provider):
 PROVIDERS = {"codex": Codex, "claude": Claude}
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(description="Read limits and switch Codex and Claude Code accounts.")
     parser.add_argument("provider", nargs="?", metavar="codex|claude")
     parser.add_argument("account", nargs="?", metavar="email|login|add")
@@ -333,12 +336,13 @@ def main():
     if args.device_auth and (args.account != "login" or args.provider != "codex"):
         parser.error("--device-auth requires codex login")
     providers = [PROVIDERS[args.provider]()] if args.provider else [cls() for cls in PROVIDERS.values()]
-    failed = False
     found = False
-    for provider in providers:
-        provider.accounts.mkdir(parents=True, exist_ok=True, mode=0o700)
-        provider.accounts.chmod(0o700)
-        with (provider.accounts / ".lock").open("a") as lock:
+    listing = []
+    with ExitStack() as stack:
+        for provider in providers:
+            provider.accounts.mkdir(parents=True, exist_ok=True, mode=0o700)
+            provider.accounts.chmod(0o700)
+            lock = stack.enter_context((provider.accounts / ".lock").open("a"))
             fcntl.flock(lock, fcntl.LOCK_EX)
             current = provider.current()
             active = provider.save(current) if current else None
@@ -356,24 +360,31 @@ def main():
                     provider.activate(target)
                 print(f"{provider.title} active account: {provider.email(target)}")
             else:
-                paths = list(provider.accounts.glob("*.json"))
-                print(provider.title, flush=True)
-                if not paths:
-                    print(f"  No saved accounts. Run ax {provider.name} login.")
-                    continue
-                with ThreadPoolExecutor(max_workers=min(CONFIG["workers"], len(paths))) as pool:
-                    for address, text, ok in pool.map(provider.status, paths, buffersize=CONFIG["workers"]):
-                        print(f"{'*' if address == active else ' '} {address}\n    {text}", flush=True)
-                        failed |= not ok
+                listing.append((provider, active, list(provider.accounts.glob("*.json"))))
+        if listing:
+            async with httpx.AsyncClient(
+                timeout=CONFIG["timeout_seconds"], limits=httpx.Limits(max_connections=CONFIG["workers"]),
+            ) as client:
+                results = await asyncio.gather(*(
+                    asyncio.gather(*(provider.status(client, path, active) for path in paths))
+                    for provider, active, paths in listing
+                ))
+            sections = [
+                {"title": provider.title, "name": provider.name, "accounts": accounts}
+                for (provider, _, _), accounts in zip(listing, results)
+            ]
+            print(TEMPLATES.get_template("ax.j2").render(providers=sections), end="")
+            if any(not account["ok"] for accounts in results for account in accounts):
+                return 1
     if args.account not in (None, "login", "add") and not found:
         print("Account not found. Run ax codex login or ax claude login.", file=sys.stderr)
         return 1
-    return int(failed)
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        sys.exit(asyncio.run(main()))
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"ax: {exc}", file=sys.stderr)
         sys.exit(1)

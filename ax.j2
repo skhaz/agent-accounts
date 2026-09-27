@@ -1,0 +1,11 @@
+{% for provider in providers %}
+{{ provider.title }}
+{% for account in provider.accounts %}
+{{ "*" if account.active else " " }} {{ account.address }}
+{% for line in account.lines %}
+    {{ line }}
+{% endfor %}
+{% else %}
+  No saved accounts. Run ax {{ provider.name }} login.
+{% endfor %}
+{% endfor %}
