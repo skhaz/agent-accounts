@@ -1,9 +1,23 @@
-codex_home = "~/.codex"
+timeout_seconds = 15
+workers = 8
+
+[codex]
+home = "~/.codex"
 auth_file = "auth.json"
 accounts_dir = "cx/accounts"
-codex_command = "codex"
+command = "codex"
 usage_url = "https://chatgpt.com/backend-api/wham/usage"
 token_url = "https://auth.openai.com/oauth/token"
 client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
-timeout_seconds = 15
-workers = 8
+
+[claude]
+home = "~/.claude"
+config_file = "~/.claude.json"
+credentials_file = ".credentials.json"
+keychain_service = "Claude Code-credentials"
+accounts_dir = "ax/accounts"
+command = "claude"
+usage_url = "https://api.anthropic.com/api/oauth/usage"
+token_url = "https://platform.claude.com/v1/oauth/token"
+client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+beta = "oauth-2025-04-20"
