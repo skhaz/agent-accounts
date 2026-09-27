@@ -60,6 +60,11 @@ async def request(client, url, headers=None, data=None):
     return response.json()
 
 
+def claims(token):
+    payload = token.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+
+
 def remaining_text(duration, used, reset):
     remaining = max(0, min(100, 100 - used))
     text = f"{duration}: {remaining:g}% left"
@@ -84,15 +89,20 @@ class Provider:
             write(path, auth)
         return address
 
-    async def status(self, client, path, active):
-        auth = read(path)
-        address = self.email(auth)
+    async def fetch(self, client, path, auth):
+        if self.expired(auth):
+            auth = await self.refresh(client, path, auth)
         try:
-            data = await self.usage(client, auth)
+            return await self.usage(client, auth)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code != 401:
                 raise
-            data = await self.usage(client, await self.refresh(client, path, auth))
+        return await self.usage(client, await self.refresh(client, path, auth))
+
+    async def status(self, client, path, active):
+        auth = read(path)
+        address = self.email(auth)
+        data = await self.fetch(client, path, auth)
         return {"address": address, "active": address == active, "lines": self.limits(data)}
 
 
@@ -111,9 +121,11 @@ class Codex(Provider):
         write(self.auth, auth)
 
     def email(self, auth):
-        payload = auth["tokens"]["id_token"].split(".")[1]
-        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        return (claims.get("email") or claims["https://api.openai.com/profile"]["email"]).casefold()
+        values = claims(auth["tokens"]["id_token"])
+        return (values.get("email") or values["https://api.openai.com/profile"]["email"]).casefold()
+
+    def expired(self, auth):
+        return claims(auth["tokens"]["access_token"]).get("exp", float("inf")) <= time.time()
 
     async def usage(self, client, auth):
         tokens = auth["tokens"]
@@ -251,6 +263,9 @@ class Claude(Provider):
 
     def email(self, auth):
         return auth["oauthAccount"]["emailAddress"].casefold()
+
+    def expired(self, auth):
+        return auth["claudeAiOauth"].get("expiresAt", float("inf")) <= time.time() * 1000
 
     async def usage(self, client, auth):
         return await request(client, self.config["usage_url"], headers={
