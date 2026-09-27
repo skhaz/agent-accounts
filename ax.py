@@ -85,24 +85,15 @@ class Provider:
         return address
 
     async def status(self, client, path, active):
-        address = path.stem
+        auth = read(path)
+        address = self.email(auth)
         try:
-            auth = read(path)
-            address = self.email(auth)
-            try:
-                data = await self.usage(client, auth)
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code != 401:
-                    raise
-                data = await self.usage(client, await self.refresh(client, path, auth))
-            lines, ok = self.limits(data) or ["Limits not available."], True
+            data = await self.usage(client, auth)
         except httpx.HTTPStatusError as exc:
-            lines, ok = [f"HTTP {exc.response.status_code}. Run ax {self.name} login if the session expired."], False
-        except httpx.HTTPError:
-            lines, ok = ["Request failed. Check the connection and try again."], False
-        except (KeyError, ValueError, TypeError, OSError, subprocess.CalledProcessError) as exc:
-            lines, ok = [f"Cannot read account status: {type(exc).__name__}."], False
-        return {"address": address, "active": address == active, "lines": lines, "ok": ok}
+            if exc.response.status_code != 401:
+                raise
+            data = await self.usage(client, await self.refresh(client, path, auth))
+        return {"address": address, "active": address == active, "lines": self.limits(data)}
 
 
 class Codex(Provider):
@@ -309,9 +300,7 @@ class Claude(Provider):
                     env={**os.environ, "CLAUDE_CONFIG_DIR": str(directory)}, check=True,
                 )
                 credentials = self.credentials(directory, service)
-                account = (read(directory / ".claude.json") or {}).get("oauthAccount")
-                if not credentials or not credentials.get("claudeAiOauth") or not account:
-                    raise ValueError("login did not store credentials")
+                account = read(directory / ".claude.json")["oauthAccount"]
                 return self.save({"claudeAiOauth": credentials["claudeAiOauth"], "oauthAccount": account})
             finally:
                 if sys.platform == "darwin":
@@ -374,8 +363,6 @@ async def main():
                 for (provider, _, _), accounts in zip(listing, results)
             ]
             print(TEMPLATES.get_template("ax.j2").render(providers=sections), end="")
-            if any(not account["ok"] for accounts in results for account in accounts):
-                return 1
     if args.account not in (None, "login", "add") and not found:
         print("Account not found. Run ax codex login or ax claude login.", file=sys.stderr)
         return 1
@@ -383,10 +370,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(asyncio.run(main()))
-    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
-        print(f"ax: {exc}", file=sys.stderr)
-        sys.exit(1)
-    except KeyboardInterrupt:
-        sys.exit(130)
+    sys.exit(asyncio.run(main()))
