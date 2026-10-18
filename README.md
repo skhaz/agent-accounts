@@ -1,7 +1,7 @@
 # ax
 
-Show remaining Codex and Claude Code limits and switch accounts by email.
-Requires `uv`, Python 3.14+, the Codex CLI or Claude Code, and macOS or Linux.
+Show remaining Codex, Claude Code, and OpenCode limits and switch accounts by email.
+Requires `uv`, Python 3.14+, the Codex CLI, Claude Code, or OpenCode, and macOS or Linux.
 
 Run from the project folder to create the command link:
 
@@ -18,9 +18,11 @@ Add the `export` line to your shell configuration to keep it after a restart.
 | `ax` | Show saved accounts and remaining limits. `*` marks the active account. |
 | `ax codex` | Show only Codex accounts. |
 | `ax claude` | Show only Claude Code accounts. |
+| `ax opencode` | Show only OpenCode accounts. |
 | `ax codex login` | Save another Codex account without changing the active account. |
 | `ax codex login --device-auth` | Sign in to Codex with a device code. |
 | `ax claude login` | Save another Claude Code account without changing the active account. |
+| `ax opencode login` | Save another OpenCode account without changing the active account. |
 | `ax add` | Save the current accounts. |
 | `ax user@example.com` | Activate a saved account in each tool that has it. |
 | `ax claude user@example.com` | Activate a saved account in one tool. |
@@ -58,3 +60,12 @@ On Linux, they are in `~/.claude/.credentials.json`.
 The active account is in `~/.claude.json`.
 Saved accounts are in `~/.claude/ax/accounts/`.
 `CLAUDE_CONFIG_DIR` overrides the configured Claude Code folder.
+
+## OpenCode
+
+Accounts are in the OpenCode credential store. `ax opencode login` runs the
+OpenCode Console device flow. `ax opencode user@example.com` runs
+`opencode auth switch`.
+
+`ax` reads the OpenCode Go limits with the active credential. OpenCode renews
+the token. `ax` never renews it.

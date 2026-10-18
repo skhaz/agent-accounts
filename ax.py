@@ -7,7 +7,7 @@
 import argparse
 import asyncio
 import base64
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 import fcntl
 import getpass
@@ -74,13 +74,87 @@ def remaining_text(duration, used, reset):
 
 
 class Provider:
+    title = ""
+
     def __init__(self, name):
         self.name = name
         self.config = CONFIG[name]
+
+    @contextmanager
+    def locked(self):
+        yield
+
+    def email(self, auth):
+        raise NotImplementedError
+
+    def identity(self, auth):
+        return self.email(auth)
+
+    def expired(self, auth):
+        return False
+
+    def current(self):
+        raise NotImplementedError
+
+    def saved(self):
+        raise NotImplementedError
+
+    def save(self, auth):
+        return self.email(auth)
+
+    def find(self, address):
+        wanted = address.casefold()
+        return next((auth for auth in self.saved() if self.email(auth) == wanted), None)
+
+    def activate(self, auth):
+        raise NotImplementedError
+
+    def login(self, device_auth):
+        raise NotImplementedError
+
+    def limits(self, data):
+        raise NotImplementedError
+
+    async def usage(self, client, auth):
+        raise NotImplementedError
+
+    async def refresh(self, client, auth):
+        return auth
+
+    async def fetch(self, client, auth):
+        if self.expired(auth):
+            auth = await self.refresh(client, auth)
+        try:
+            return await self.usage(client, auth)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 401:
+                raise
+        return await self.usage(client, await self.refresh(client, auth))
+
+    async def status(self, client, auth, active):
+        address = self.email(auth)
+        data = await self.fetch(client, auth)
+        return {"address": address, "active": self.identity(auth) == active, "lines": self.limits(data)}
+
+
+class FileProvider(Provider):
+    def __init__(self, name):
+        super().__init__(name)
         self.accounts = self.home / self.config["accounts_dir"]
+
+    @contextmanager
+    def locked(self):
+        self.accounts.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.accounts.chmod(0o700)
+        with (self.accounts / ".lock").open("a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            yield
 
     def account_path(self, address):
         return self.accounts / (hashlib.sha256(address.casefold().encode()).hexdigest() + ".json")
+
+    def saved(self):
+        return [auth for path in sorted(self.accounts.glob("*.json")) if (auth := read(path))]
 
     def save(self, auth):
         address = self.email(auth)
@@ -89,24 +163,8 @@ class Provider:
             write(path, auth)
         return address
 
-    async def fetch(self, client, path, auth):
-        if self.expired(auth):
-            auth = await self.refresh(client, path, auth)
-        try:
-            return await self.usage(client, auth)
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code != 401:
-                raise
-        return await self.usage(client, await self.refresh(client, path, auth))
 
-    async def status(self, client, path, active):
-        auth = read(path)
-        address = self.email(auth)
-        data = await self.fetch(client, path, auth)
-        return {"address": address, "active": address == active, "lines": self.limits(data)}
-
-
-class Codex(Provider):
+class Codex(FileProvider):
     title = "Codex"
 
     def __init__(self):
@@ -134,7 +192,7 @@ class Codex(Provider):
             "ChatGPT-Account-Id": tokens["account_id"],
         })
 
-    async def refresh(self, client, path, auth):
+    async def refresh(self, client, auth):
         current = self.current()
         if current and self.email(current) == self.email(auth) and current != auth:
             self.save(current)
@@ -149,7 +207,7 @@ class Codex(Provider):
             if result.get(key):
                 auth["tokens"][key] = result[key]
         auth["last_refresh"] = datetime.now(timezone.utc).isoformat()
-        write(path, auth)
+        self.save(auth)
         current = self.current()
         if current and current["tokens"] == original:
             self.activate(auth)
@@ -187,7 +245,7 @@ class Codex(Provider):
             return self.save(read(Path(directory) / self.config["auth_file"]))
 
 
-class Claude(Provider):
+class Claude(FileProvider):
     title = "Claude"
 
     def __init__(self):
@@ -273,7 +331,7 @@ class Claude(Provider):
             "anthropic-beta": self.config["beta"],
         })
 
-    async def refresh(self, client, path, auth):
+    async def refresh(self, client, auth):
         current = await asyncio.to_thread(self.current)
         if current and self.email(current) == self.email(auth) and current != auth:
             self.save(current)
@@ -289,7 +347,7 @@ class Claude(Provider):
             auth["claudeAiOauth"]["refreshToken"] = result["refresh_token"]
         if result.get("expires_in"):
             auth["claudeAiOauth"]["expiresAt"] = int((time.time() + result["expires_in"]) * 1000)
-        write(path, auth)
+        self.save(auth)
         current = await asyncio.to_thread(self.current)
         if current and current["claudeAiOauth"] == original:
             await asyncio.to_thread(self.write_credentials, auth["claudeAiOauth"])
@@ -322,12 +380,133 @@ class Claude(Provider):
                     self.keychain_delete(service)
 
 
-PROVIDERS = {"codex": Codex, "claude": Claude}
+class OpenCode(Provider):
+    title = "OpenCode"
+
+    WINDOWS = (("rolling", "5h"), ("weekly", "7d"), ("monthly", "30d"))
+
+    def __init__(self):
+        super().__init__("opencode")
+        self.cache = None
+
+    def credentials(self):
+        if self.cache is None:
+            result = subprocess.run(
+                [self.config["command"], "auth", "export"], capture_output=True, text=True, check=True,
+            )
+            self.cache = [
+                item for item in json.loads(result.stdout)
+                if item["integrationID"] == self.config["integration"]
+            ]
+        return self.cache
+
+    @staticmethod
+    def rank(auth):
+        return bool(auth.get("active")), auth["id"]
+
+    def key(self, auth):
+        metadata = auth["value"]["metadata"]
+        return metadata["email"].casefold(), metadata.get("orgID")
+
+    def saved(self):
+        best = {}
+        for auth in self.credentials():
+            found = best.get(self.key(auth))
+            if found is None or self.rank(auth) > self.rank(found):
+                best[self.key(auth)] = auth
+        return list(best.values())
+
+    def current(self):
+        return next((auth for auth in self.credentials() if auth.get("active")), None)
+
+    def email(self, auth):
+        return auth["value"]["metadata"]["email"].casefold()
+
+    def identity(self, auth):
+        return self.key(auth)
+
+    def expired(self, auth):
+        expires = auth["value"].get("expires")
+        return expires is not None and expires <= time.time() * 1000
+
+    def activate(self, auth):
+        subprocess.run(
+            [self.config["command"], "auth", "switch", self.config["integration"], auth["id"]], check=True,
+        )
+
+    def logout(self, auth):
+        subprocess.run(
+            [self.config["command"], "auth", "logout", self.config["integration"], auth["id"]], check=True,
+        )
+
+    def login(self, device_auth):
+        previous = self.current()
+        known = {auth["id"] for auth in self.credentials()}
+        subprocess.run(
+            [self.config["command"], "auth", "login", self.config["integration"], "--method", "device"], check=True,
+        )
+        self.cache = None
+        auths = self.credentials()
+        account = next((auth for auth in auths if auth["id"] not in known), None) or previous
+        if account is None:
+            return None
+        for auth in auths:
+            if auth["id"] != account["id"] and self.key(auth) == self.key(account):
+                self.logout(auth)
+                self.cache = None
+        target = previous if previous and self.key(previous) != self.key(account) else account
+        active = self.current()
+        if active is None or active["id"] != target["id"]:
+            self.activate(target)
+        return self.email(account)
+
+    async def usage(self, client, auth):
+        return await request(client, self.config["usage_url"], headers={
+            "Authorization": "Bearer " + auth["value"]["access"],
+        })
+
+    async def fetch(self, client, auth):
+        if self.expired(auth):
+            raise ValueError("OpenCode Console token expired")
+        try:
+            return await self.usage(client, auth)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (401, 403):
+                raise ValueError("OpenCode Console token rejected")
+            raise
+
+    async def status(self, client, auth, active):
+        address = self.email(auth)
+        try:
+            lines = self.limits(await self.fetch(client, auth))
+        except ValueError as exc:
+            lines = [f"{exc} · run {self.config['command']} to renew it"]
+        except httpx.HTTPStatusError as exc:
+            lines = [f"OpenCode Go: usage unavailable (HTTP {exc.response.status_code})"]
+        return {"address": address, "active": self.identity(auth) == active, "lines": lines}
+
+    def limits(self, data):
+        usage = data.get("usage") or {}
+        windows = []
+        for key, duration in self.WINDOWS:
+            window = usage.get(key)
+            if not window:
+                continue
+            reset = window.get("resetsAt")
+            reset = datetime.fromisoformat(reset) if reset else None
+            windows.append(remaining_text(duration, window.get("percent") or 0, reset))
+        text = "OpenCode Go: " + (" | ".join(windows) or "percentage not available")
+        if any(window.get("status") not in (None, "ok") for window in usage.values()):
+            text += " · limit reached"
+        return [text]
+
+
+PROVIDERS = {"codex": Codex, "claude": Claude, "opencode": OpenCode}
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Read limits and switch Codex and Claude Code accounts.")
-    parser.add_argument("provider", nargs="?", metavar="codex|claude")
+    parser = argparse.ArgumentParser(description="Read limits and switch Codex, Claude Code, and OpenCode accounts.")
+    parser.add_argument("provider", nargs="?", metavar="codex|claude|opencode")
     parser.add_argument("account", nargs="?", metavar="email|login|add")
     parser.add_argument("--device-auth", action="store_true", help="use a device code with codex login")
     args = parser.parse_args()
@@ -336,7 +515,7 @@ async def main():
             parser.error(f"unknown provider: {args.provider}")
         args.provider, args.account = None, args.provider
     if args.account == "login" and args.provider is None:
-        parser.error("login requires codex or claude")
+        parser.error("login requires codex, claude, or opencode")
     if args.device_auth and (args.account != "login" or args.provider != "codex"):
         parser.error("--device-auth requires codex login")
     providers = [PROVIDERS[args.provider]()] if args.provider else [cls() for cls in PROVIDERS.values()]
@@ -344,19 +523,21 @@ async def main():
     listing = []
     with ExitStack() as stack:
         for provider in providers:
-            provider.accounts.mkdir(parents=True, exist_ok=True, mode=0o700)
-            provider.accounts.chmod(0o700)
-            lock = stack.enter_context((provider.accounts / ".lock").open("a"))
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            stack.enter_context(provider.locked())
             current = provider.current()
-            active = provider.save(current) if current else None
+            if current:
+                provider.save(current)
+                active = provider.identity(current)
+                address = provider.email(current)
+            else:
+                active = address = None
             if args.account == "login":
                 address = provider.login(args.device_auth)
                 print(f"{provider.title} account saved: {address}\nTo activate: ax {provider.name} {address}")
             elif args.account == "add":
-                print(f"{provider.title} account saved: {active}" if active else f"{provider.title}: no active account. Run ax {provider.name} login.")
+                print(f"{provider.title} account saved: {address}" if address else f"{provider.title}: no active account. Run ax {provider.name} login.")
             elif args.account:
-                target = read(provider.account_path(args.account))
+                target = provider.find(args.account)
                 if target is None:
                     continue
                 found = True
@@ -364,14 +545,14 @@ async def main():
                     provider.activate(target)
                 print(f"{provider.title} active account: {provider.email(target)}")
             else:
-                listing.append((provider, active, list(provider.accounts.glob("*.json"))))
+                listing.append((provider, active, provider.saved()))
         if listing:
             async with httpx.AsyncClient(
                 timeout=CONFIG["timeout_seconds"], limits=httpx.Limits(max_connections=CONFIG["workers"]),
             ) as client:
                 results = await asyncio.gather(*(
-                    asyncio.gather(*(provider.status(client, path, active) for path in paths))
-                    for provider, active, paths in listing
+                    asyncio.gather(*(provider.status(client, auth, active) for auth in auths))
+                    for provider, active, auths in listing
                 ))
             sections = [
                 {"title": provider.title, "name": provider.name, "accounts": accounts}
@@ -379,7 +560,7 @@ async def main():
             ]
             print(TEMPLATES.get_template("ax.j2").render(providers=sections), end="")
     if args.account not in (None, "login", "add") and not found:
-        print("Account not found. Run ax codex login or ax claude login.", file=sys.stderr)
+        print("Account not found. Run ax codex login, ax claude login, or ax opencode login.", file=sys.stderr)
         return 1
     return 0
 
